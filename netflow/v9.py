@@ -17,6 +17,9 @@ import ipaddress
 import struct
 
 
+FIELD_TYPES_CONTAINING_IP = [8, 12, 15, 18, 27, 28, 62, 63]
+
+
 FIELD_TYPES = {
     0: 'UNKNOWN_FIELD_TYPE',  # fallback for unknown field types
 
@@ -211,7 +214,7 @@ class DataFlowSet:
                     fdata += byte << (idx * 8)
 
                 # Special handling of IP addresses to convert integers to strings to not lose precision in dump
-                if fkey in ["IPV4_SRC_ADDR", "IPV4_DST_ADDR", "IPV6_SRC_ADDR", "IPV6_DST_ADDR"]:
+                if field.field_type in FIELD_TYPES_CONTAINING_IP:
                     try:
                         ip = ipaddress.ip_address(fdata)
                     except ValueError:
