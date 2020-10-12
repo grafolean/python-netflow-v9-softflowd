@@ -158,7 +158,8 @@ FIELD_TYPES = {
 
 
 class TemplateNotRecognized(KeyError):
-    pass
+    def __init__(self, template_id):
+        self.template_id = template_id
 
 
 class DataRecord:
@@ -191,7 +192,7 @@ class DataFlowSet:
         offset = 4
 
         if self.template_id not in templates:
-            raise TemplateNotRecognized
+            raise TemplateNotRecognized(self.template_id)
 
         template = templates[self.template_id]
 
