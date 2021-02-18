@@ -2,22 +2,23 @@
 
 """
 Netflow V9 collector and parser implementation in Python 3.
+This file belongs to https://github.com/bitkeks/python-netflow-v9-softflowd.
 Created for learning purposes and unsatisfying alternatives.
 
 Reference: https://www.cisco.com/en/US/technologies/tk648/tk362/technologies_white_paper09186a00800a3db9.html
+This script is specifically implemented in combination with softflowd. See https://github.com/djmdjm/softflowd
 
-This script is specifically implemented in combination with softflowd.
-See https://github.com/djmdjm/softflowd
-
-Copyright 2017, 2018 Dominik Pataky <dev@bitkeks.eu>
+Copyright 2016-2020 Dominik Pataky <software+pynetflow@dpataky.eu>
 Licensed under MIT License. See LICENSE.
 """
 
 import ipaddress
 import struct
 
+__all__ = ["V9DataFlowSet", "V9DataRecord", "V9ExportPacket", "V9Header", "V9TemplateField",
+           "V9TemplateFlowSet", "V9TemplateNotRecognized", "V9TemplateRecord"]
 
-FIELD_TYPES = {
+V9_FIELD_TYPES = {
     0: 'UNKNOWN_FIELD_TYPE',  # fallback for unknown field types
 
     # Cisco specs for NetFlow v9
@@ -115,7 +116,8 @@ FIELD_TYPES = {
     94: 'APPLICATION_DESCRIPTION',  # Application description
     95: 'APPLICATION_TAG',  # 8 bits of engine ID, followed by n bits of classification
     96: 'APPLICATION_NAME',  # Name associated with a classification
-    98: 'postipDiffServCodePoint',  # The value of a Differentiated Services Code Point (DSCP) encoded in the Differentiated Services Field, after modification
+    98: 'postipDiffServCodePoint',  # The value of a Differentiated Services Code Point (DSCP)
+                                    # encoded in the Differentiated Services Field, after modification
     99: 'replication_factor',  # Multicast replication factor
     100: 'DEPRECATED',  # DEPRECATED
     102: 'layer2packetSectionOffset',  # Layer 2 packet section offset. Potentially a generic offset
@@ -143,7 +145,7 @@ FIELD_TYPES = {
     231: 'NF_F_FWD_FLOW_DELTA_BYTES',  # The delta number of bytes from source to destination
     232: 'NF_F_REV_FLOW_DELTA_BYTES',  # The delta number of bytes from destination to source
     33000: 'NF_F_INGRESS_ACL_ID',  # The input ACL that permitted or denied the flow
-    33001: 'NF_F_EGRESS_ACL_ID',  #  The output ACL that permitted or denied a flow
+    33001: 'NF_F_EGRESS_ACL_ID',  # The output ACL that permitted or denied a flow
     40000: 'NF_F_USERNAME',  # AAA username
 
     # PaloAlto PAN-OS 8.0
@@ -154,18 +156,18 @@ FIELD_TYPES = {
 }
 
 
-class TemplateNotRecognized(KeyError):
+class V9TemplateNotRecognized(KeyError):
     pass
 
 
-class DataRecord:
+class V9DataRecord:
     """This is a 'flow' as we want it from our source. What it contains is
     variable in NetFlow V9, so to work with the data you have to analyze the
     data dict keys (which are integers and can be mapped with the FIELD_TYPES
     dict).
-
     Should hold a 'data' dict with keys=field_type (integer) and value (in bytes).
     """
+
     def __init__(self):
         self.data = {}
 
@@ -173,11 +175,12 @@ class DataRecord:
         return "<DataRecord with data: {}>".format(self.data)
 
 
-class DataFlowSet:
+class V9DataFlowSet:
     """Holds one or multiple DataRecord which are all defined after the same
     template. This template is referenced in the field 'flowset_id' of this
     DataFlowSet and must not be zero.
     """
+
     def __init__(self, data, templates):
         pack = struct.unpack('!HH', data[:4])
 
@@ -188,7 +191,7 @@ class DataFlowSet:
         offset = 4
 
         if self.template_id not in templates:
-            raise TemplateNotRecognized
+            raise V9TemplateNotRecognized
 
         template = templates[self.template_id]
 
@@ -196,14 +199,14 @@ class DataFlowSet:
         padding_size = 4 - (self.length % 4)  # 4 Byte
 
         while offset <= (self.length - padding_size):
-            new_record = DataRecord()
+            new_record = V9DataRecord()
 
             for field in template.fields:
                 flen = field.field_length
-                fkey = FIELD_TYPES[field.field_type]
+                fkey = V9_FIELD_TYPES[field.field_type]
 
                 # The length of the value byte slice is defined in the template
-                dataslice = data[offset:offset+flen]
+                dataslice = data[offset:offset + flen]
 
                 # Better solution than struct.unpack with variable field length
                 fdata = 0
@@ -211,6 +214,7 @@ class DataFlowSet:
                     fdata += byte << (idx * 8)
 
                 # Special handling of IP addresses to convert integers to strings to not lose precision in dump
+                # TODO: might only be needed for IPv6
                 if fkey in ["IPV4_SRC_ADDR", "IPV4_DST_ADDR", "IPV6_SRC_ADDR", "IPV6_DST_ADDR"]:
                     try:
                         ip = ipaddress.ip_address(fdata)
@@ -223,26 +227,31 @@ class DataFlowSet:
 
                 offset += flen
 
+            new_record.__dict__.update(new_record.data)
             self.flows.append(new_record)
 
     def __repr__(self):
-        return "<DataFlowSet with template {} of length {} holding {} flows>"\
+        return "<DataFlowSet with template {} of length {} holding {} flows>" \
             .format(self.template_id, self.length, len(self.flows))
 
 
-class TemplateField:
-    """A field with type identifier and length."""
+class V9TemplateField:
+    """A field with type identifier and length.
+    """
+
     def __init__(self, field_type, field_length):
         self.field_type = field_type  # integer
         self.field_length = field_length  # bytes
 
     def __repr__(self):
         return "<TemplateField type {}:{}, length {}>".format(
-            self.field_type, FIELD_TYPES[self.field_type], self.field_length)
+            self.field_type, V9_FIELD_TYPES[self.field_type], self.field_length)
 
 
-class TemplateRecord:
-    """A template record contained in a TemplateFlowSet."""
+class V9TemplateRecord:
+    """A template record contained in a TemplateFlowSet.
+    """
+
     def __init__(self, template_id, field_count, fields):
         self.template_id = template_id
         self.field_count = field_count
@@ -251,15 +260,16 @@ class TemplateRecord:
     def __repr__(self):
         return "<TemplateRecord {} with {} fields: {}>".format(
             self.template_id, self.field_count,
-            ' '.join([FIELD_TYPES[field.field_type] for field in self.fields]))
+            ' '.join([V9_FIELD_TYPES[field.field_type] for field in self.fields]))
 
 
-class TemplateFlowSet:
+class V9TemplateFlowSet:
     """A template flowset, which holds an id that is used by data flowsets to
     reference back to the template. The template then has fields which hold
     identifiers of data types (eg "IP_SRC_ADDR", "PKTS"..). This way the flow
     sender can dynamically put together data flowsets.
     """
+
     def __init__(self, data):
         pack = struct.unpack('!HH', data[:4])
         self.flowset_id = pack[0]
@@ -270,7 +280,7 @@ class TemplateFlowSet:
 
         # Iterate through all template records in this template flowset
         while offset < self.length:
-            pack = struct.unpack('!HH', data[offset:offset+4])
+            pack = struct.unpack('!HH', data[offset:offset + 4])
             template_id = pack[0]
             field_count = pack[1]
 
@@ -278,14 +288,14 @@ class TemplateFlowSet:
             for field in range(field_count):
                 # Get all fields of this template
                 offset += 4
-                field_type, field_length = struct.unpack('!HH', data[offset:offset+4])
-                if field_type not in FIELD_TYPES:
+                field_type, field_length = struct.unpack('!HH', data[offset:offset + 4])
+                if field_type not in V9_FIELD_TYPES:
                     field_type = 0  # Set field_type to UNKNOWN_FIELD_TYPE as fallback
-                field = TemplateField(field_type, field_length)
+                field = V9TemplateField(field_type, field_length)
                 fields.append(field)
 
             # Create a template object with all collected data
-            template = TemplateRecord(template_id, field_count, fields)
+            template = V9TemplateRecord(template_id, field_count, fields)
 
             # Append the new template to the global templates list
             self.templates[template.template_id] = template
@@ -294,18 +304,17 @@ class TemplateFlowSet:
             offset += 4
 
     def __repr__(self):
-        return "<TemplateFlowSet with id {} of length {} containing templates: {}>"\
+        return "<TemplateFlowSet with id {} of length {} containing templates: {}>" \
             .format(self.flowset_id, self.length, self.templates.keys())
 
 
-class Header:
-    """The header of the V9ExportPacket"""
-
+class V9Header:
+    """The header of the V9ExportPacket
+    """
     length = 20
 
     def __init__(self, data):
         pack = struct.unpack('!HHIIII', data[:self.length])
-
         self.version = pack[0]
         self.count = pack[1]  # not sure if correct. softflowd: no of flows
         self.uptime = pack[2]
@@ -313,37 +322,67 @@ class Header:
         self.sequence = pack[4]
         self.source_id = pack[5]
 
+    def to_dict(self):
+        return self.__dict__
+
 
 class V9ExportPacket:
-    """The flow record holds the header and all template and data flowsets."""
+    """The flow record holds the header and all template and data flowsets.
+    """
 
     def __init__(self, data, templates):
-        self.header = Header(data)
-        self.templates = templates
+        self.header = V9Header(data)
+        self._templates = templates
         self._new_templates = False
-        self.flows = []
+        self._flows = []
 
         offset = self.header.length
+        skipped_flowsets_offsets = []
         while offset != len(data):
-            flowset_id = struct.unpack('!H', data[offset:offset+2])[0]
+            flowset_id = struct.unpack('!H', data[offset:offset + 2])[0]
             if flowset_id == 0:  # TemplateFlowSet always have id 0
-                tfs = TemplateFlowSet(data[offset:])
+                tfs = V9TemplateFlowSet(data[offset:])
+
                 # Check for any new/changed templates
                 if not self._new_templates:
                     for id_, template in tfs.templates.items():
-                        if id_ not in self.templates or self.templates[id_] != template:
+                        if id_ not in self._templates or self._templates[id_] != template:
                             self._new_templates = True
                             break
-                self.templates.update(tfs.templates)
+
+                # Update the templates with the provided templates, even if they are the same
+                self._templates.update(tfs.templates)
                 offset += tfs.length
             else:
-                dfs = DataFlowSet(data[offset:], self.templates)
-                self.flows += dfs.flows
-                offset += dfs.length
+                try:
+                    dfs = V9DataFlowSet(data[offset:], self._templates)
+                    self._flows += dfs.flows
+                    offset += dfs.length
+                except V9TemplateNotRecognized:
+                    # Could not be parsed, continue to check for templates
+                    length = struct.unpack("!H", data[offset + 2:offset + 4])[0]
+                    skipped_flowsets_offsets.append(offset)
+                    offset += length
+
+        if skipped_flowsets_offsets and self._new_templates:
+            # Process flowsets in the data slice which occured before the template sets
+            for offset in skipped_flowsets_offsets:
+                dfs = V9DataFlowSet(data[offset:], self._templates)
+                self._flows += dfs.flows
+        elif skipped_flowsets_offsets:
+            raise V9TemplateNotRecognized
 
     @property
     def contains_new_templates(self):
         return self._new_templates
+
+    @property
+    def flows(self):
+        return self._flows
+
+    @property
+    def templates(self):
+        return self._templates
 
     def __repr__(self):
         s = " and new template(s)" if self.contains_new_templates else ""

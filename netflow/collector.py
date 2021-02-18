@@ -1,32 +1,39 @@
 #!/usr/bin/env python3
 
 """
-Example collector script for NetFlow v1, v5, and v9.
+Reference collector script for NetFlow v1, v5, and v9 Python package.
 This file belongs to https://github.com/bitkeks/python-netflow-v9-softflowd.
 
-Copyright 2017-2020 Dominik Pataky <dev@bitkeks.eu>
+Copyright 2016-2020 Dominik Pataky <software+pynetflow@dpataky.eu>
 Licensed under MIT License. See LICENSE.
 """
-
 import argparse
-from collections import namedtuple
-import queue
 import gzip
 import json
 import logging
-import sys
+import queue
+import signal
+import socket
 import socketserver
 import threading
 import time
+from collections import namedtuple
 
-from netflow import parse_packet, TemplateNotRecognized, UnknownNetFlowVersion
+from .ipfix import IPFIXTemplateNotRecognized
+from .utils import UnknownExportVersion, parse_packet
+from .v9 import V9TemplateNotRecognized
 
-logger = logging.getLogger(__name__)
+RawPacket = namedtuple('RawPacket', ['ts', 'client', 'data'])
+ParsedPacket = namedtuple('ParsedPacket', ['ts', 'client', 'export'])
 
 # Amount of time to wait before dropping an undecodable ExportPacket
 PACKET_TIMEOUT = 60 * 60
 
-RawPacket = namedtuple('RawPacket', ['ts', 'client', 'data'])
+logger = logging.getLogger("netflow-collector")
+ch = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+ch.setFormatter(formatter)
+logger.addHandler(ch)
 
 
 class QueuingRequestHandler(socketserver.BaseRequestHandler):
@@ -42,12 +49,18 @@ class QueuingUDPListener(socketserver.ThreadingUDPServer):
     """A threaded UDP server that adds a (time, data) tuple to a queue for
     every request it sees
     """
+
     def __init__(self, interface, queue):
         self.queue = queue
+
+        # If IPv6 interface addresses are used, override the default AF_INET family
+        if ":" in interface[0]:
+            self.address_family = socket.AF_INET6
+
         super().__init__(interface, QueuingRequestHandler)
 
 
-class NetFlowListener(threading.Thread):
+class ThreadedNetFlowListener(threading.Thread):
     """A thread that listens for incoming NetFlow packets, processes them, and
     makes them available to consumers.
 
@@ -58,7 +71,7 @@ class NetFlowListener(threading.Thread):
     - When joined, will wait for the listener to exit
 
     For example, a simple script that outputs data until killed with CTRL+C:
-    >>> listener = NetFlowListener('0.0.0.0', 2055)
+    >>> listener = ThreadedNetFlowListener('0.0.0.0', 2055)
     >>> print("Listening for NetFlow packets")
     >>> listener.start() # start processing packets
     >>> try:
@@ -75,7 +88,7 @@ class NetFlowListener(threading.Thread):
     ...     print("Stopped!")
     """
 
-    def __init__(self, host, port):
+    def __init__(self, host: str, port: int):
         logger.info("Starting the NetFlow listener on {}:{}".format(host, port))
         self.output = queue.Queue()
         self.input = queue.Queue()
@@ -85,7 +98,7 @@ class NetFlowListener(threading.Thread):
         self._shutdown = threading.Event()
         super().__init__()
 
-    def get(self, block=True, timeout=None):
+    def get(self, block=True, timeout=None) -> ParsedPacket:
         """Get a processed flow.
 
         If optional args 'block' is true and 'timeout' is None (the default),
@@ -101,44 +114,50 @@ class NetFlowListener(threading.Thread):
     def run(self):
         # Process packets from the queue
         try:
-            templates = {}
+            # TODO: use per-client templates
+            templates = {"netflow": {}, "ipfix": {}}
             to_retry = []
             while not self._shutdown.is_set():
                 try:
                     # 0.5s delay to limit CPU usage while waiting for new packets
-                    pkt: RawPacket = self.input.get(block=True, timeout=0.5)
+                    pkt = self.input.get(block=True, timeout=0.5)  # type: RawPacket
                 except queue.Empty:
                     continue
 
                 try:
+                    # templates is passed as reference, updated in V9ExportPacket
                     export = parse_packet(pkt.data, templates)
-                except UnknownNetFlowVersion as e:
+                except UnknownExportVersion as e:
                     logger.error("%s, ignoring the packet", e)
                     continue
-                except TemplateNotRecognized:
+                except (V9TemplateNotRecognized, IPFIXTemplateNotRecognized):
+                    # TODO: differentiate between v9 and IPFIX, use separate to_retry lists
                     if time.time() - pkt.ts > PACKET_TIMEOUT:
-                        logger.warning("Dropping an old and undecodable v9 ExportPacket")
+                        logger.warning("Dropping an old and undecodable v9/IPFIX ExportPacket")
                     else:
                         to_retry.append(pkt)
-                        logger.debug("Failed to decode a v9 ExportPacket - will "
+                        logger.debug("Failed to decode a v9/IPFIX ExportPacket - will "
                                      "re-attempt when a new template is discovered")
                     continue
 
-                logger.debug("Processed a v%d ExportPacket with %d flows.",
-                             export.header.version, export.header.count)
+                if export.header.version == 10:
+                    logger.debug("Processed an IPFIX ExportPacket with length %d.", export.header.length)
+                else:
+                    logger.debug("Processed a v%d ExportPacket with %d flows.",
+                                 export.header.version, export.header.count)
 
                 # If any new templates were discovered, dump the unprocessable
                 # data back into the queue and try to decode them again
-                if export.header.version == 9 and export.contains_new_templates and to_retry:
+                if export.header.version in [9, 10] and export.contains_new_templates and to_retry:
                     logger.debug("Received new template(s)")
-                    logger.debug("Will re-attempt to decode %d old v9 ExportPackets",
-                                 len(to_retry))
+                    logger.debug("Will re-attempt to decode %d old v9/IPFIX ExportPackets", len(to_retry))
                     for p in to_retry:
                         self.input.put(p)
                     to_retry.clear()
 
-                self.output.put((pkt.ts, pkt.client, export))
+                self.output.put(ParsedPacket(pkt.ts, pkt.client, export))
         finally:
+            # Only reached when while loop ends
             self.server.shutdown()
             self.server.server_close()
 
@@ -151,18 +170,31 @@ class NetFlowListener(threading.Thread):
         super().join(timeout=timeout)
 
 
-def get_export_packets(host, port):
-    """A generator that will yield ExportPacket objects until it is killed"""
+def get_export_packets(host: str, port: int) -> ParsedPacket:
+    """A threaded generator that will yield ExportPacket objects until it is killed
+    """
+    def handle_signal(s, f):
+        logger.debug("Received signal {}, raising StopIteration".format(s))
+        raise StopIteration
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
 
-    listener = NetFlowListener(host, port)
+    listener = ThreadedNetFlowListener(host, port)
     listener.start()
+
     try:
         while True:
             yield listener.get()
+    except StopIteration:
+        pass
     finally:
         listener.stop()
         listener.join()
 
+
+if __name__ == "netflow.collector":
+    logger.error("The collector is currently meant to be used as a CLI tool only.")
+    logger.error("Use 'python3 -m netflow.collector -h' in your console for additional help.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="A sample netflow collector.")
@@ -177,10 +209,9 @@ if __name__ == "__main__":
                         help="Enable debug output")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(message)s")
-
     if args.debug:
         logger.setLevel(logging.DEBUG)
+        ch.setLevel(logging.DEBUG)
 
     try:
         # With every parsed flow a new line is appended to the output file. In previous versions, this was implemented
@@ -200,6 +231,7 @@ if __name__ == "__main__":
         for ts, client, export in get_export_packets(args.host, args.port):
             entry = {ts: {
                 "client": client,
+                "header": export.header.to_dict(),
                 "flows": [flow.data for flow in export.flows]}
             }
             line = json.dumps(entry).encode() + b"\n"  # byte encoded line
