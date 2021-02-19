@@ -13,10 +13,11 @@ Licensed under MIT License. See LICENSE.
 """
 
 import ipaddress
+import logging
 import struct
 
 __all__ = ["V9DataFlowSet", "V9DataRecord", "V9ExportPacket", "V9Header", "V9TemplateField",
-           "V9TemplateFlowSet", "V9TemplateNotRecognized", "V9TemplateRecord"]
+           "V9TemplateFlowSet", "V9TemplateNotRecognized", "V9OptionsTemplatesNotSupported", "V9TemplateRecord"]
 
 V9_FIELD_TYPES = {
     0: 'UNKNOWN_FIELD_TYPE',  # fallback for unknown field types
@@ -160,6 +161,10 @@ class V9TemplateNotRecognized(KeyError):
     pass
 
 
+class V9OptionsTemplatesNotSupported(KeyError):
+    pass
+
+
 class V9DataRecord:
     """This is a 'flow' as we want it from our source. What it contains is
     variable in NetFlow V9, so to work with the data you have to analyze the
@@ -191,7 +196,12 @@ class V9DataFlowSet:
         offset = 4
 
         if self.template_id not in templates:
+            logging.debug(f"Missing template id: {self.template_id}")
             raise V9TemplateNotRecognized
+
+        if templates[self.template_id] is None:
+            logging.debug(f"Template id is known, but it is Options Template: {self.template_id} (not yet supported)")
+            raise V9OptionsTemplatesNotSupported
 
         template = templates[self.template_id]
 
@@ -353,6 +363,11 @@ class V9ExportPacket:
                 # Update the templates with the provided templates, even if they are the same
                 self._templates.update(tfs.templates)
                 offset += tfs.length
+            elif flowset_id == 1:  # Options Template has a FlowSet ID of 1
+                length, template_id, = struct.unpack('!HH', data[offset + 2:offset + 6])
+                logging.debug(f"Encountered Options Template - not supported yet, skipping! (template ID: {template_id})")
+                self._templates[template_id] = None
+                offset += length
             else:
                 try:
                     dfs = V9DataFlowSet(data[offset:], self._templates)
